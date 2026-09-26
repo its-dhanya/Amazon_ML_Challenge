@@ -1,0 +1,14 @@
+{
+  "run_id": "cand_v2_cap5",
+  "argv": [
+    "s4union.py",
+    "val",
+    "lex=data/branch_candidates/val_sparkly.parquet:20",
+    "wa=runs/cand_v2/branches/val_Wa.parquet:5",
+    "cn=runs/cand_v2/branches/val_Cn.parquet:5"
+  ],
+  "started": "2026-09-26 23:28:39",
+  "git_commit": "0c5481f83d55bb465c6a4270672edff7e503c3ff",
+  "git_dirty": true,
+  "python": "C:\\Users\\bhadr\\.conda\\envs\\boneage\\python.exe"
+}

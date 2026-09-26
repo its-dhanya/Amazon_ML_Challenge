@@ -28,3 +28,8 @@ Dhanya/runs/**
 !Dhanya/runs/*/config.json
 !Dhanya/runs/*/metrics.json
 !Dhanya/runs/*/blend.json
+
+# Virtual environments
+.venv/
+venv/
+env/

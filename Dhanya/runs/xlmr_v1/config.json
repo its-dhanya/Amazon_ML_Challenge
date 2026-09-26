@@ -1,0 +1,11 @@
+{
+  "run_id": "xlmr_v1",
+  "argv": [
+    "xlmr_cross.py",
+    "train"
+  ],
+  "started": "2026-09-26 23:47:31",
+  "git_commit": "0c5481f83d55bb465c6a4270672edff7e503c3ff",
+  "git_dirty": true,
+  "python": "C:\\Users\\bhadr\\.conda\\envs\\boneage\\python.exe"
+}

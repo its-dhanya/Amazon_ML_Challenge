@@ -15,3 +15,11 @@ tqdm==4.67.1
 # String similarity (C extensions)
 rapidfuzz==3.14.5
 jellyfish==1.2.1
+
+# Submission 2: romanization (character n-gram branch) and the XLM-R cross-encoder
+anyascii==0.3.3
+# Install the CUDA build of torch (needed for the XLM-R steps):
+#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1
+transformers==5.17.0
+huggingface_hub   # only to download FacebookAI/xlm-roberta-base (MIT) once, see README

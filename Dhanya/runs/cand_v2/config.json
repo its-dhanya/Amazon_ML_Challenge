@@ -1,0 +1,17 @@
+{
+  "run_id": "cand_v2",
+  "argv": [
+    "s4ngram.py",
+    "run",
+    "val",
+    "India",
+    "1",
+    "1",
+    "Wa",
+    "Cn"
+  ],
+  "started": "2026-09-26 23:03:11",
+  "git_commit": "0c5481f83d55bb465c6a4270672edff7e503c3ff",
+  "git_dirty": true,
+  "python": "C:\\Users\\bhadr\\.conda\\envs\\boneage\\python.exe"
+}

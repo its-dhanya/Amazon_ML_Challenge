@@ -1,0 +1,11 @@
+{
+  "run_id": "lgb_test_v2",
+  "argv": [
+    "s5lgbm.py",
+    "test"
+  ],
+  "started": "2026-09-27 00:33:41",
+  "git_commit": "0c5481f83d55bb465c6a4270672edff7e503c3ff",
+  "git_dirty": true,
+  "python": "C:\\Users\\bhadr\\.conda\\envs\\boneage\\python.exe"
+}
