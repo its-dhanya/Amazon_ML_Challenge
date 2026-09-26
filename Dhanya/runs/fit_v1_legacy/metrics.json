@@ -1,0 +1,33 @@
+{
+  "holdout_f05_one_to_one": 0.9036,
+  "threshold": 0.64,
+  "best_iteration": 484,
+  "pool_run": null,
+  "featset": "v1",
+  "n_pairs": 1955482,
+  "positive_rate": 0.3492,
+  "features": [
+    "name_jw",
+    "name_tsort",
+    "name_tset",
+    "name_ratio",
+    "name_exact",
+    "name_len_ratio",
+    "addr_jw",
+    "addr_tsort",
+    "addr_tset",
+    "addr_num_jacc",
+    "pin_eq",
+    "state_eq",
+    "lex_rank",
+    "lex_score",
+    "lex_rel",
+    "dense_rank",
+    "n_cands",
+    "name_jw_gap",
+    "name_jw_rank",
+    "rec_n_s1",
+    "rec_lex_rank",
+    "rec_name_gap"
+  ]
+}

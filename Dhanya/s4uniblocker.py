@@ -20,9 +20,9 @@ from src.utils.nnblocker import DenseVectorizer, FaissIndexer, NNBlocker  # noqa
 
 CLEAN = ROOT / "data/cleaned"
 OUT = ROOT / "data/branch_candidates"
-MODEL = ROOT / "models/uniblocker_amazon.ckpt"
-BASE_MODEL = ROOT / "models/paraphrase-multilingual-MiniLM-L12-v2"
-TOP_K = 50
+MODEL = ROOT / "data/models/uniblocker_amazon.ckpt"
+BASE_MODEL = ROOT / "data/models/paraphrase-multilingual-MiniLM-L12-v2"
+TOP_K = 20
 
 
 def load_model() -> UniBlocker:
@@ -41,7 +41,9 @@ def run_split(split: str, model: UniBlocker) -> None:
     s1 = pd.read_parquet(CLEAN / f"{split}_s1.parquet")
     index = pd.concat([pd.read_parquet(CLEAN / f"{split}_{s}.parquet") for s in ("s2", "s3")], ignore_index=True)
     all_pairs = []
-    vectorizer = DenseVectorizer(model, model.collate_fn, torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    vectorizer = DenseVectorizer(model, model.collate_fn, device)
     for country, q in s1.groupby("country", sort=False):
         d = index[index.country.eq(country)]
         if d.empty:
@@ -59,7 +61,7 @@ def run_split(split: str, model: UniBlocker) -> None:
 
 def main() -> None:
     model = load_model()
-    for split in ("train", "val", "test"):
+    for split in (sys.argv[1:] or ["val"]):
         run_split(split, model)
 
 

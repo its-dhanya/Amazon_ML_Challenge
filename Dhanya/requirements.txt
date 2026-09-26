@@ -1,27 +1,17 @@
-# Core data
-pandas>=2.0
-pyarrow>=14.0
-numpy>=1.26
+# Python 3.10. Versions are the ones the submitted runs used.
 
-# String similarity
-jellyfish>=1.0       # Jaro-Winkler (C extension, fast)
-rapidfuzz>=3.0       # token_sort_ratio, token_set_ratio (C extension)
+# Data
+numpy==1.26.4
+pandas==2.3.3
+pyarrow==23.0.1
 
-# Candidate generation (run on the configured Spark cluster)
-pyspark>=3.5
-sparkly-em>=0.1.0
-sentence-transformers>=3.0
-# Install UniBlocker separately from its approved source; its branch job must
-# write the Parquet contract documented in Step 4.
+# Lexical candidate generation (sparse BM25) and the pair classifier
+scipy==1.15.3
+scikit-learn==1.7.2
+lightgbm==4.6.0
+joblib==1.5.2
+tqdm==4.67.1
 
-# Classifier + evaluation
-splink>=4.0
-# PySpark is already listed above; use Splink's Spark backend at challenge scale.
-# Retained temporarily for the legacy scorer until the Splink adapter replaces it.
-scikit-learn>=1.4
-joblib>=1.3
-
-# Unicode / transliteration (if Indic scripts appear in profiling)
-# Uncomment if Step 1 profiling shows Devanagari/Tamil/Telugu:
-# transliterate>=1.10
-# indic-transliteration>=2.3
+# String similarity (C extensions)
+rapidfuzz==3.14.5
+jellyfish==1.2.1

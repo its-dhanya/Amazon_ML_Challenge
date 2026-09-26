@@ -5,11 +5,12 @@ from pathlib import Path
 import logging
 import numpy as np
 import pandas as pd
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 KEEP_COLS = ["entity_id", "business_name", "business_address", "country"]
-TRAIN_DIR, TEST_DIR = Path("student_resource/dataset/train"), Path("student_resource/dataset/test")
+TRAIN_DIR, TEST_DIR = Path("../dataset/student_resource/dataset/train"), Path("../dataset/student_resource/dataset/test")
 OUT_DIR = Path("data/processed")
 
 
