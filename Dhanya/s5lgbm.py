@@ -33,8 +33,13 @@ GT = Path("data/processed")
 CACHE = Path("data/cache")  # feature caches are keyed by pool run + a hash of FEATS and store the pair ids (checked on load)
 POOL_RUN = os.environ.get("POOL_RUN")  # run whose candidates/ holds the pool; unset = legacy data/candidates
 FEATSET = os.environ.get("FEATSET", "v1")
-V2 = FEATSET in ("v2", "v3")  # v2 adds multi-branch and cross-script/glued-name features
-V3 = FEATSET == "v3"          # v3 adds the dense (bi-encoder) branch score features
+V2 = FEATSET in ("v2", "v3", "v4", "v5", "v6")  # v2 adds multi-branch and cross-script/glued-name features
+V3 = FEATSET in ("v3", "v4", "v5", "v6")        # v3 adds the dense (bi-encoder) branch score features
+V4 = FEATSET in ("v4", "v5", "v6")              # v4 adds how unique the S1 name / address is in the S1 reference set
+V5 = FEATSET in ("v5", "v6")                    # v5 adds IDF-weighted (rare-token-aware) name and address overlap for every pair
+V6 = FEATSET == "v6"                            # v6 adds the cross-encoder's own score as a feature (so the tree, not a fixed
+                                                 # blend weight, decides when to trust it) plus name-confidence-when-no-address
+XLMR_FEAT_PATH = os.environ.get("XLMR_FEAT_PATH")  # v6 only: parquet of entity_id_s1, entity_id_s2s3, xlmr covering every role
 REC = ["entity_id", "name_clean", "addr_clean", "pin_zip", "state_code"]
 CHUNK = 1_000_000
 UNSEEN_THRESHOLD = 0.75
@@ -51,7 +56,11 @@ FEATS_V2_EXTRA = [
     "name_desp_ratio", "name_desp_partial", "name_skel_ratio", "addr_i_empty", "is_s3",
 ]
 FEATS_V3_EXTRA = ["dense_score", "dense_rel"]   # dense_rank is already in FEATS_V1 (it was the UniBlocker slot)
-FEATS = FEATS_V1 + (FEATS_V2_EXTRA if V2 else []) + (FEATS_V3_EXTRA if V3 else [])
+FEATS_V4_EXTRA = ["s1_name_cnt", "s1_addr_cnt", "s1_name_idf"]
+FEATS_V5_EXTRA = ["addr_cos", "addr_cov_s1", "addr_cov_rec", "name_cos", "name_cov_s1", "name_cov_rec"]
+FEATS_V6_EXTRA = ["xlmr_score", "name_conf_no_addr", "name_rank1_no_addr", "name_idf_no_addr"]
+FEATS = (FEATS_V1 + (FEATS_V2_EXTRA if V2 else []) + (FEATS_V3_EXTRA if V3 else []) + (FEATS_V4_EXTRA if V4 else [])
+         + (FEATS_V5_EXTRA if V5 else []) + (FEATS_V6_EXTRA if V6 else []))
 BRANCH_COLS = ["lex_rank", "lex_score", "dense_rank", "dense_score", "wa_rank", "wa_score", "cn_rank", "cn_score"]
 
 
@@ -161,6 +170,72 @@ def base_features(p: pd.DataFrame) -> pd.DataFrame:
     return f
 
 
+def s1_uniqueness(split: str, s1: pd.DataFrame) -> pd.DataFrame:
+    """How unique an S1 record's name and address are among ALL known S1 entities of comparable size:
+    val uses train+val S1 (2.2M), test uses test S1 (1.7M), so the counts mean the same thing in both.
+    Returns log(count of S1 with the same normalized name), same for the address, and the mean IDF of the name tokens."""
+    ref = [pd.read_parquet(CLEAN / f"{split}_s1.parquet", columns=["name_clean", "addr_clean"])]
+    if split == "val":
+        ref.append(pd.read_parquet(CLEAN / "train_s1.parquet", columns=["name_clean", "addr_clean"]))
+    ref = pd.concat(ref, ignore_index=True)
+    squash = lambda x: x.fillna("").str.lower().str.replace(r"\W+", "", regex=True)
+    n_ref = len(ref)
+    name_cnt, addr_cnt = squash(ref.name_clean).value_counts(), squash(ref.addr_clean).value_counts()
+    tok_df = ref.name_clean.fillna("").str.lower().str.findall(r"\w+").explode().value_counts()
+    out = pd.DataFrame(index=s1.index)
+    out["s1_name_cnt"] = np.log(name_cnt.reindex(squash(s1.name_clean).to_numpy()).fillna(1).to_numpy())
+    out["s1_addr_cnt"] = np.log(addr_cnt.reindex(squash(s1.addr_clean).to_numpy()).fillna(1).to_numpy())
+    toks = s1.name_clean.fillna("").str.lower().str.findall(r"\w+")
+    idf = toks.map(lambda t: float(np.mean([np.log(n_ref / tok_df.get(w, 1)) for w in t])) if t else 0.0)
+    out["s1_name_idf"] = idf.to_numpy()
+    return out
+
+
+def _safe_div(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    out = np.full(len(a), np.nan, np.float32)
+    np.divide(a, b, out=out, where=b > 0)
+    return out
+
+
+def idf_features(pairs: pd.DataFrame, s1: pd.DataFrame, idx: pd.DataFrame, split: str) -> np.ndarray:
+    """IDF-weighted token overlap between the S1 record and the S2/S3 record for the address and for the name.
+    Per country (IDF from that country's records) and per field: cosine of the IDF-weighted token sets, the share of the S1
+    side's IDF mass that the record contains, and the share of the record's IDF mass that the S1 explains. Rare tokens (a street
+    name) count far more than common ones (a city or region), so 'same number and city, different street' is no longer a match.
+    Returns an array (n_pairs, 6): addr cos / cov_s1 / cov_rec, name cos / cov_s1 / cov_rec."""
+    from sklearn.feature_extraction.text import CountVectorizer
+    ctry = pd.read_parquet(CLEAN / f"{split}_s1.parquet", columns=["entity_id", "country"]).set_index("entity_id").country
+    pc = ctry.reindex(pairs.entity_id_s1).to_numpy()
+    out = np.full((len(pairs), 6), np.nan, np.float32)
+    for c in pd.unique(pc):
+        m = np.flatnonzero(pc == c)
+        sub = pairs.iloc[m]
+        rec_ids, s1_ids = pd.unique(sub.entity_id_s2s3), pd.unique(sub.entity_id_s1)
+        r_rows = pd.Series(np.arange(len(rec_ids)), rec_ids).reindex(sub.entity_id_s2s3).to_numpy()
+        s_rows = pd.Series(np.arange(len(s1_ids)), s1_ids).reindex(sub.entity_id_s1).to_numpy()
+        for col0, field in ((0, "addr_clean"), (3, "name_clean")):
+            rt = idx[field].reindex(rec_ids).fillna("").replace("missing", "")
+            st = s1[field].reindex(s1_ids).fillna("")
+            vec = CountVectorizer(binary=True, token_pattern=r"(?u)\b\w+\b", dtype=np.float32)
+            B = vec.fit_transform(rt).tocsr()
+            A = vec.transform(st).tocsr()
+            df = np.asarray(B.sum(0)).ravel()
+            w = (np.log((B.shape[0] + 1) / (df + 1)) + 1).astype(np.float32)
+            w2 = w * w
+            aw, aw2, bw, bw2 = A @ w, A @ w2, B @ w, B @ w2
+            for k in range(0, len(sub), 1_000_000):
+                sl = slice(k, k + 1_000_000)
+                shared = A[s_rows[sl]].multiply(B[r_rows[sl]]).tocsr()
+                sw, sw2 = shared @ w, shared @ w2
+                a_w, a_w2, b_w, b_w2 = aw[s_rows[sl]], aw2[s_rows[sl]], bw[r_rows[sl]], bw2[r_rows[sl]]
+                out[m[sl], col0] = _safe_div(sw2, np.sqrt(a_w2 * b_w2))
+                out[m[sl], col0 + 1] = _safe_div(sw, a_w)
+                out[m[sl], col0 + 2] = _safe_div(sw, b_w)
+            del A, B
+        print(f"  idf features [{c}]: {len(m):,} pairs", flush=True)
+    return out
+
+
 def build_features(pairs: pd.DataFrame, split: str) -> pd.DataFrame:
     """One row per pair, columns FEATS, index aligned with pairs."""
     s1, idx = load_records(pairs, split)
@@ -169,6 +244,14 @@ def build_features(pairs: pd.DataFrame, split: str) -> pd.DataFrame:
         parts.append(base_features(attach_records(pairs.iloc[i:i + CHUNK], s1, idx)))
         print(f"  features {min(i + CHUNK, len(pairs)):,}/{len(pairs):,}", flush=True)
     f = pd.concat(parts)
+    if V4:
+        sf = s1_uniqueness(split, s1)
+        for c in FEATS_V4_EXTRA:
+            f[c] = sf[c].reindex(pairs.entity_id_s1).to_numpy(np.float32)
+    if V5:
+        ex = idf_features(pairs, s1, idx, split)
+        for j, c in enumerate(FEATS_V5_EXTRA):
+            f[c] = ex[:, j]
     for c in ("lex_rank", "lex_score", "lex_rel", "dense_rank") + (("wa_rank", "wa_score", "wa_rel", "cn_rank", "cn_score", "cn_rel", "n_branches") if V2 else ()):
         f[c] = pairs[c].to_numpy(np.float32)
     if V3:
@@ -184,6 +267,17 @@ def build_features(pairs: pd.DataFrame, split: str) -> pd.DataFrame:
     f["rec_n_s1"] = by_rec.name_jw.transform("size").astype(np.float32)
     f["rec_lex_rank"] = by_rec.lex_score.rank(ascending=False, method="min")
     f["rec_name_gap"] = f.name_jw - by_rec.name_jw.transform("max")
+    if V6:
+        # the cross-encoder's own score, only defined for pairs in someone's uncertain zone; NaN elsewhere (LightGBM
+        # handles that natively). A tree can learn to trust it only when there's an address to read, unlike a fixed
+        # blend weight applied everywhere -- see the diagnosis: XLM-R AUC 0.72 with no address vs 0.98 with one.
+        xl = pd.read_parquet(XLMR_FEAT_PATH)
+        key = pd.DataFrame({"entity_id_s1": g_s1, "entity_id_s2s3": g_rec})
+        f["xlmr_score"] = key.merge(xl, how="left", on=["entity_id_s1", "entity_id_s2s3"]).xlmr.to_numpy()
+        # isolate the "no address to check" regime: is the name evidence alone strong/rare/unambiguous?
+        f["name_conf_no_addr"] = f.name_jw * f.addr_i_empty
+        f["name_rank1_no_addr"] = (f.name_jw_rank == 1).astype(np.float32) * f.addr_i_empty
+        f["name_idf_no_addr"] = f.s1_name_idf * f.addr_i_empty
     return f
 
 
@@ -287,7 +381,7 @@ def fit() -> None:
     joblib.dump({"model": m, "threshold": t, "feats": FEATS}, model_path)
     (rd / "metrics.json").write_text(json.dumps({
         "holdout_f05_one_to_one": round(f05, 4), "threshold": round(float(t), 3), "best_iteration": int(m.best_iteration_),
-        "pool_run": POOL_RUN, "featset": "v2" if V2 else "v1", "n_pairs": int(len(pairs)), "positive_rate": round(float(pairs.label.mean()), 4), "features": FEATS}, indent=2))
+        "pool_run": POOL_RUN, "featset": FEATSET, "n_pairs": int(len(pairs)), "positive_rate": round(float(pairs.label.mean()), 4), "features": FEATS}, indent=2))
     print(f"\nsaved {model_path} (threshold {t:.2f}); metrics in {rd / 'metrics.json'}")
 
 

@@ -201,6 +201,71 @@ def evaluate() -> None:
     print(f"  gain from XLM-R blend: {res['blend'][0] - res['prob'][0]:+.4f}")
 
 
+def train2() -> None:
+    """Continue training the cross-encoder (XLMR_INIT_RUN) on pairs from the TRAIN split (never val or test entities): each mined anchor
+    gives up to 2 true records (label 1) and 2 hard negatives from the bi-encoder search (label 0), with a checkpoint every 4000 steps."""
+    rd = run_dir()
+    mined = pd.read_parquet(RUNS / os.environ["MINED_RUN"] / "mined_train.parquet")
+    mined = mined[mined.negs.map(len) > 0].sample(frac=1, random_state=1).head(int(os.environ.get("N_ANCHORS", 300_000)))
+    rng = np.random.RandomState(0)
+    rows = []
+    for a, pos, negs in zip(mined.entity_id_s1, mined.pos, mined.negs):
+        rows += [(a, p, 1) for p in pos[:2]]
+        rows += [(a, negs[j], 0) for j in rng.choice(min(len(negs), 8), size=min(2, len(negs)), replace=False)]
+    tr = pd.DataFrame(rows, columns=["entity_id_s1", "entity_id_s2s3", "label"]).sample(frac=1, random_state=2).reset_index(drop=True)
+    print(f"train pairs {len(tr):,} from {len(mined):,} anchors, positive rate {tr.label.mean():.1%}", flush=True)
+    cols = ["entity_id", "name_clean", "addr_clean"]
+    i1, i2 = set(tr.entity_id_s1), set(tr.entity_id_s2s3)
+    s1 = pd.read_parquet(CLEAN / "train_s1.parquet", columns=cols)
+    s1 = s1[s1.entity_id.isin(i1)].set_index("entity_id")
+    idx = pd.concat([pd.read_parquet(CLEAN / f"val_{s}.parquet", columns=cols).pipe(lambda d: d[d.entity_id.isin(i2)]) for s in ("s2", "s3")]).set_index("entity_id")   # val_s2/s3 == train pool
+
+    def fmt(t, ids):
+        n = t.name_clean.reindex(ids).fillna("").to_numpy()
+        ad = t.addr_clean.reindex(ids).fillna("").replace("missing", "").to_numpy()
+        return [f"{x} | {y}" for x, y in zip(n, ad)]
+    a, b = fmt(s1, tr.entity_id_s1), fmt(idx, tr.entity_id_s2s3)
+    y = torch.tensor(tr.label.to_numpy(), dtype=torch.float32)
+    init = RUNS / os.environ["XLMR_INIT_RUN"] / "xlmr"
+    tok = AutoTokenizer.from_pretrained(init)
+    model = AutoModelForSequenceClassification.from_pretrained(init).cuda()
+    model.roberta.embeddings.word_embeddings.weight.requires_grad = False
+    lr = float(os.environ.get("XLMR_LR", 1e-5))
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=0.01)
+    steps = len(tr) // BS
+    sched = get_linear_schedule_with_warmup(opt, int(0.03 * steps), steps)
+    scaler = torch.amp.GradScaler("cuda")
+    lossf = torch.nn.BCEWithLogitsLoss()
+    ck, step = rd / "train_ckpt.pt", 0
+    if ck.exists():
+        st = torch.load(ck, map_location="cuda")
+        model.load_state_dict(st["model"]); opt.load_state_dict(st["opt"]); sched.load_state_dict(st["sched"]); step = st["step"]
+        print(f"resumed from step {step}", flush=True)
+    t0, run = time.time(), 0.0
+    model.train()
+    while step < steps:
+        ix = np.arange(step * BS, (step + 1) * BS)
+        enc = tokenize_pairs(tok, [a[j] for j in ix], [b[j] for j in ix]).to("cuda")
+        with torch.autocast("cuda", dtype=torch.float16):
+            logits = model(**enc).logits.squeeze(-1)
+        loss = lossf(logits.float(), y[ix].cuda())
+        opt.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(opt); scaler.update(); sched.step()
+        run = 0.98 * run + 0.02 * loss.item() if step else loss.item()
+        step += 1
+        if step % 200 == 0:
+            print(f"step {step}/{steps} loss {run:.4f}  elapsed {time.time() - t0:.0f}s", flush=True)
+        if step % int(os.environ.get("CKPT_EVERY", 4000)) == 0 and step < steps:
+            torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(), "step": step}, str(ck) + ".tmp")
+            os.replace(str(ck) + ".tmp", ck)
+    model.save_pretrained(rd / "xlmr")
+    tok.save_pretrained(rd / "xlmr")
+    print(f"saved {rd / 'xlmr'} after {time.time() - t0:.0f}s")
+
+
 UNSEEN_THRESHOLD = 0.80   # countries absent from training: the country-held-out check favoured a stricter cutoff
 
 
@@ -215,9 +280,19 @@ def test_stage() -> None:
     border = ((scores.prob >= blend["lo"]) & (scores.prob <= blend["hi"])).to_numpy()
     print(f"test pairs {len(scores):,}; uncertain zone {border.sum():,} ({border.mean():.1%})", flush=True)
 
-    sub = scores[border]
+    sub = scores[border].reset_index(drop=True)
+    # An XLM-R score depends only on the pair's text and the model, so scores already computed for another classifier's
+    # uncertain zone can be reused (XLMR_CACHE = comma-separated parquet files with entity_id_s1, entity_id_s2s3, xlmr).
+    KEYS2 = ["entity_id_s1", "entity_id_s2s3"]
+    known = np.full(len(sub), np.nan, np.float32)
+    for path in filter(None, os.environ.get("XLMR_CACHE", "").split(",")):
+        c = pd.read_parquet(path).drop_duplicates(KEYS2)
+        known = np.where(np.isnan(known), sub[KEYS2].merge(c, how="left", on=KEYS2).xlmr.to_numpy(np.float32), known)
+    need = np.flatnonzero(np.isnan(known))
+    print(f"  XLM-R scores reused from cache: {len(sub) - len(need):,}; still to score: {len(need):,}", flush=True)
+    todo = sub.iloc[need]
     cols = ["entity_id", "name_clean", "addr_clean"]
-    i1, i2 = set(sub.entity_id_s1), set(sub.entity_id_s2s3)
+    i1, i2 = set(todo.entity_id_s1), set(todo.entity_id_s2s3)
     s1 = pd.read_parquet(CLEAN / "test_s1.parquet", columns=cols + ["country"])
     country = s1.set_index("entity_id").country
     s1 = s1[s1.entity_id.isin(i1)].set_index("entity_id")
@@ -227,27 +302,31 @@ def test_stage() -> None:
         n = t.name_clean.reindex(ids).fillna("").to_numpy()
         a = t.addr_clean.reindex(ids).fillna("").replace("missing", "").to_numpy()
         return [f"{x} | {y}" for x, y in zip(n, a)]
-    a, b = fmt(s1, sub.entity_id_s1), fmt(idx, sub.entity_id_s2s3)
+    a, b = fmt(s1, todo.entity_id_s1), fmt(idx, todo.entity_id_s2s3)
     del s1, idx
-    mdir = RUNS / (os.environ.get("XLMR_MODEL_RUN") or os.environ["XLMR_RUN"]) / "xlmr"
-    tok = AutoTokenizer.from_pretrained(mdir)
-    model = AutoModelForSequenceClassification.from_pretrained(mdir).cuda()
     t0 = time.time()
+    if len(a):
+        mdir = RUNS / (os.environ.get("XLMR_MODEL_RUN") or os.environ["XLMR_RUN"]) / "xlmr"
+        tok = AutoTokenizer.from_pretrained(mdir)
+        model = AutoModelForSequenceClassification.from_pretrained(mdir).cuda()
     ck = rd / "ckpt"
     ck.mkdir(exist_ok=True)
-    xl, BLK = np.empty(len(a), np.float32), 200_000
+    xl_new, BLK = np.empty(len(a), np.float32), 200_000
     for b0 in range(0, len(a), BLK):
         f = ck / f"xl_{b0}.npy"
         if f.exists():
-            xl[b0:b0 + BLK] = np.load(f)
+            xl_new[b0:b0 + BLK] = np.load(f)
             print(f"  block {b0:,}: loaded from checkpoint", flush=True)
             continue
         part = score(model, tok, a[b0:b0 + BLK], b[b0:b0 + BLK])
         np.save(str(f) + ".tmp.npy", part)
         os.replace(str(f) + ".tmp.npy", f)   # atomic: a crash can never leave a half-written checkpoint under its final name
-        xl[b0:b0 + BLK] = part
+        xl_new[b0:b0 + BLK] = part
         print(f"  scored {min(b0 + BLK, len(a)):,}/{len(a):,}  ({time.time() - t0:.0f}s)", flush=True)
-    print(f"XLM-R scored {len(a):,} pairs in {time.time() - t0:.0f}s ({len(a) / (time.time() - t0):.0f}/s)", flush=True)
+    xl = known.copy()
+    xl[need] = xl_new
+    pd.DataFrame({"entity_id_s1": sub.entity_id_s1.to_numpy(), "entity_id_s2s3": sub.entity_id_s2s3.to_numpy(), "xlmr": xl}).to_parquet(rd / "xlmr_scores.parquet", index=False)
+    print(f"XLM-R scored {len(a):,} new pairs in {time.time() - t0:.0f}s; total {len(xl):,} scores saved to {rd / 'xlmr_scores.parquet'}", flush=True)
 
     prob = scores.prob.to_numpy().astype(np.float64)
     z = blend["intercept"] + blend["coef"][0] * logit(prob[border]) + blend["coef"][1] * xl
@@ -265,4 +344,4 @@ def test_stage() -> None:
 
 
 if __name__ == "__main__":
-    {"train": train, "eval": evaluate, "test": test_stage}[sys.argv[1]]()
+    {"train": train, "train2": train2, "eval": evaluate, "test": test_stage}[sys.argv[1]]()

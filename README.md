@@ -8,6 +8,7 @@ All code is in [`Dhanya/`](Dhanya/); run everything from inside that directory.
 | 1 | Per-country sparse BM25 blocking + LightGBM pair classifier | 0.904 | **0.879** |
 | 2 | + address-only and character n-gram blocking, cross-script features, XLM-R cross-encoder on uncertain pairs | 0.959 | **0.941** |
 | 3 | + dense (semantic) retrieval with a fine-tuned multilingual bi-encoder, dense features in the classifier | 0.974 | **0.964** |
+| 4 | + name/address uniqueness and IDF token-overlap features; cross-encoder retrained on the (previously unused) train split with mined hard negatives, fused as a classifier feature instead of a separate blend | 0.981 | **0.971** |
 
 ## Approach
 
@@ -22,11 +23,24 @@ All code is in [`Dhanya/`](Dhanya/); run everything from inside that directory.
      exact nearest-neighbour search on the GPU, top 5 per S1 entity; it lifts val pool recall from 93.3% to 97.6%;
    - the branches are unioned per pair, keeping each branch's rank and score (`s4union.py` / `s4representations.py`).
 3. **Pair scoring**: a LightGBM classifier on name/address similarity features (`s5lgbm.py`, `FEATSET=v1` is submission 1,
-   `FEATSET=v2` adds branch ranks/scores and cross-script, glued-name and house-number features, `FEATSET=v3` adds the dense score).
+   `FEATSET=v2` adds branch ranks/scores and cross-script, glued-name and house-number features, `FEATSET=v3` adds the dense
+   score, `FEATSET=v4` adds how unique an S1's name/address is among all S1 entities, `FEATSET=v5` adds per-country
+   IDF-weighted (rare-token-aware) name/address token overlap, `FEATSET=v6` adds the cross-encoder's own score as a
+   classifier feature plus two features isolating "no address to check" pairs (name confidence, name rarity), so the
+   tree learns when to trust the cross-encoder instead of a single fixed blend weight).
 4. **Second stage (submission 2)**: pairs whose LightGBM probability is in [0.10, 0.95] are re-scored by a fine-tuned
-   `xlm-roberta-base` cross-encoder (MIT license) and blended with LightGBM (`xlmr_cross.py`).
+   `xlm-roberta-base` cross-encoder (MIT license), `xlmr_cross.py`. Submissions 2-3 blend its score with LightGBM via a
+   logistic regression; submission 4 instead retrains the cross-encoder on the train split (never on val/test entities,
+   using hard negatives mined with the bi-encoder) and feeds its score straight into the v6 classifier as a feature.
 5. **Decision**: each S2/S3 record goes to at most one S1 entity (its highest-scoring one, true in the training labels),
    then a probability threshold tuned for F0.5 (stricter for a country unseen in training, i.e. France).
+
+Diagnosis behind submission 4: on the validation holdout, precision was already high (0.994); nearly all remaining loss was
+recall, and about half of that was pairs whose S2/S3 record had an empty address, where the cross-encoder actually scores
+*worse* than LightGBM (holdout AUC 0.72 vs 0.82) since there is no address text for it to read - so improving that second
+stage further gives little back. The fix that helped was feature-level: expose the cross-encoder's score to the tree
+(so it is only trusted when there is an address to check) and give the tree name-only signal specifically for the
+no-address case, rather than training a bigger or separate model.
 
 No external data, lookup service or API is used. The only downloaded artifact is the `xlm-roberta-base` weights.
 
@@ -151,6 +165,34 @@ checkpoint every 200K pairs and resumes from them, `s4dense.py encode` can repai
 (`FILL_MISSING=1 python s4dense.py encode test India d`), tokenization retries with a fallback path, and tokenizer
 multithreading is switched off (`TOKENIZERS_PARALLELISM=false`).
 
+### Submission 4: v4/v5 features, cross-encoder retrained on the train split, feature fusion (leaderboard 0.971)
+
+Needs submission 3's runs: `cand_v3_cap5` / `cand_v3_test_cap5` (candidate pools) and `xlmr_v1` (the base cross-encoder, used
+as the starting point for the retrain below).
+
+```bash
+# v4 (S1 uniqueness) and v5 (IDF token overlap) features, same pools as submission 3
+RUN_ID=fit_v4_cap5 POOL_RUN=cand_v3_cap5 FEATSET=v4 python s5lgbm.py fit     # holdout F0.5 0.9645 (LightGBM alone)
+RUN_ID=fit_v5_cap5 POOL_RUN=cand_v3_cap5 FEATSET=v5 python s5lgbm.py fit     # holdout F0.5 0.9710 (LightGBM alone)
+
+# mine hard negatives for 1M anchors from the (previously unused) train split, using the round-1 bi-encoder,
+# then continue training the cross-encoder (never on val/test entities) on true/negative pairs from that mined set
+RUN_ID=dense_v2 EMB_RUN=dense_v1 python s4dense.py mine 1000000 16
+RUN_ID=xlmr_big MINED_RUN=dense_v2 XLMR_INIT_RUN=xlmr_v1 N_ANCHORS=300000 python xlmr_cross.py train2
+
+# score the cross-encoder's own output on every pool pair that ever lands in someone's uncertain zone (val: all roles;
+# test: the full test pool), save it, and feed it into the classifier as a feature (FEATSET=v6) alongside two
+# features isolating the no-address case (name_conf_no_addr, name_idf_no_addr)
+RUN_ID=fit_v6 POOL_RUN=cand_v3_cap5 FEATSET=v6 XLMR_FEAT_PATH=<val all-zone xlmr scores>.parquet python s5lgbm.py fit
+# -> holdout F0.5 0.9805 (single model, no separate blend step)
+
+RUN_ID=test_v6 MODEL_RUN=fit_v6 POOL_RUN=cand_v3_test_cap5 FEATSET=v6 XLMR_FEAT_PATH=<test zone xlmr scores>.parquet python s5lgbm.py test
+# -> runs/test_v6/output/matching_results.tsv (the 0.971 file)
+```
+
+The round-2 bi-encoder (more mined training data for retrieval) was tried and discarded: it scored *worse* than round 1 on
+holdout candidate-pool ranking, so it never went into a submission.
+
 ### Validate the output
 
 ```bash
@@ -168,8 +210,8 @@ python utils/validate_submission.py --matching ../../Dhanya/runs/xlmr_test/outpu
 | `Dhanya/s4ngram.py` | independent BM25 branches: address-only (Wa), romanized character n-grams (Cn) |
 | `Dhanya/s4representations.py`, `s4union.py` | union of the branches (submission 1 / submission 2) |
 | `Dhanya/s5lgbm.py` | LightGBM pair classifier, one-to-one assignment, thresholds, TSV writer |
-| `Dhanya/s4dense.py` | dense branch: bi-encoder fine-tune, embedding, exact GPU nearest-neighbour search (submission 3) |
-| `Dhanya/xlmr_cross.py` | XLM-R cross-encoder second stage |
+| `Dhanya/s4dense.py` | dense branch: bi-encoder fine-tune (`train`), embedding + exact GPU nearest-neighbour search (submission 3); mining hard negatives from the train split and continuing training on them (`mine`, `train2`, submission 4) |
+| `Dhanya/xlmr_cross.py` | XLM-R cross-encoder: fine-tune on val (`train`, submissions 2-3) or continue training on mined train-split pairs (`train2`, submission 4), evaluate/blend (`eval`), score test (`test`) |
 | `Dhanya/runs.py`, `Dhanya/runs/` | per-run folders; only small metadata (READMEs, `config.json`, `metrics.json`, `blend.json`) is tracked |
 | `Dhanya/s4uniblocker.py`, `s4sparkly.py`, `s5splink.py`, `s5fellegisunter.py`, `s5beval.py` | earlier or abandoned attempts (dense retrieval, Sparkly, Splink), not used by either submission |
 
