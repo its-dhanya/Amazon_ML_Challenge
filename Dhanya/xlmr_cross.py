@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import sys
 import time
 from pathlib import Path
@@ -25,7 +26,7 @@ from sklearn.metrics import roc_auc_score
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup
 
 import s5lgbm as S
-from runs import RUNS, run_dir
+from runs import RUNS, run_dir, run_id
 
 CLEAN = Path("data/cleaned")
 MODEL_DIR = Path("data/models/xlm-roberta-base")
@@ -33,6 +34,21 @@ KEYS = ["entity_id_s1", "entity_id_s2s3"]
 LO, HI = 0.10, 0.95            # uncertain zone of the LightGBM probability
 MAXLEN, BS, N_TRAIN, LR = 128, 32, int(os.environ.get("N_TRAIN", 300_000)), 2e-5
 CLF_RUN = os.environ.get("CLF_RUN", "fit_v2_cap5")
+
+
+def tokenize_pairs(tok, a: list[str], b: list[str]):
+    """The fast tokenizer sometimes fails to build tensors for a batch (an intermittent 'excessive nesting' ValueError):
+    retry, then pad by hand, then encode pair by pair (an empty encoding becomes [CLS][SEP])."""
+    for _ in range(3):
+        try:
+            return tok(a, b, truncation=True, max_length=MAXLEN, padding=True, return_tensors="pt")
+        except ValueError:
+            try:
+                return tok.pad(tok(a, b, truncation=True, max_length=MAXLEN), padding=True, return_tensors="pt")
+            except ValueError:
+                time.sleep(1)
+    ids = [tok(x, y, truncation=True, max_length=MAXLEN)["input_ids"] or [tok.cls_token_id, tok.sep_token_id] for x, y in zip(a, b)]
+    return tok.pad({"input_ids": ids}, padding=True, return_tensors="pt")
 
 
 def logit(p):
@@ -72,13 +88,13 @@ def with_text(df: pd.DataFrame) -> tuple[list[str], list[str]]:
 
 
 @torch.no_grad()
-def score(model, tok, a: list[str], b: list[str], bs: int = 256) -> np.ndarray:
+def score(model, tok, a: list[str], b: list[str], bs: int = int(os.environ.get("XLMR_BS", 256))) -> np.ndarray:
     order = np.argsort([len(x) + len(y) for x, y in zip(a, b)])  # similar lengths together = less padding
     out = np.empty(len(a), np.float32)
     model.eval()
     for i in range(0, len(a), bs):
         ix = order[i:i + bs]
-        enc = tok([a[j] for j in ix], [b[j] for j in ix], truncation=True, max_length=MAXLEN, padding=True, return_tensors="pt").to("cuda")
+        enc = tokenize_pairs(tok, [a[j] for j in ix], [b[j] for j in ix]).to("cuda")
         with torch.autocast("cuda", dtype=torch.float16):
             out[ix] = model(**enc).logits.squeeze(-1).float().cpu().numpy()
     return out
@@ -107,7 +123,7 @@ def train() -> None:
     model.train()
     for step in range(steps):
         ix = perm[step * BS:(step + 1) * BS]
-        enc = tok([a[j] for j in ix], [b[j] for j in ix], truncation=True, max_length=MAXLEN, padding=True, return_tensors="pt").to("cuda")
+        enc = tokenize_pairs(tok, [a[j] for j in ix], [b[j] for j in ix]).to("cuda")
         with torch.autocast("cuda", dtype=torch.float16):
             logits = model(**enc).logits.squeeze(-1)
         loss = lossf(logits.float(), y[ix].cuda())
@@ -135,8 +151,9 @@ def eval_sets(df: pd.DataFrame):
 def evaluate() -> None:
     rd = run_dir()
     pairs = prepare()
-    tok = AutoTokenizer.from_pretrained(rd / "xlmr")
-    model = AutoModelForSequenceClassification.from_pretrained(rd / "xlmr").cuda()
+    mdir = RUNS / (os.environ.get("XLMR_MODEL_RUN") or run_id()) / "xlmr"   # the run that trained the cross-encoder
+    tok = AutoTokenizer.from_pretrained(mdir)
+    model = AutoModelForSequenceClassification.from_pretrained(mdir).cuda()
     scored = {}
     for role in (1, 2):
         sub = pairs[pairs.border & (pairs.role == role)]
@@ -212,10 +229,24 @@ def test_stage() -> None:
         return [f"{x} | {y}" for x, y in zip(n, a)]
     a, b = fmt(s1, sub.entity_id_s1), fmt(idx, sub.entity_id_s2s3)
     del s1, idx
-    tok = AutoTokenizer.from_pretrained(RUNS / os.environ["XLMR_RUN"] / "xlmr")
-    model = AutoModelForSequenceClassification.from_pretrained(RUNS / os.environ["XLMR_RUN"] / "xlmr").cuda()
+    mdir = RUNS / (os.environ.get("XLMR_MODEL_RUN") or os.environ["XLMR_RUN"]) / "xlmr"
+    tok = AutoTokenizer.from_pretrained(mdir)
+    model = AutoModelForSequenceClassification.from_pretrained(mdir).cuda()
     t0 = time.time()
-    xl = score(model, tok, a, b)
+    ck = rd / "ckpt"
+    ck.mkdir(exist_ok=True)
+    xl, BLK = np.empty(len(a), np.float32), 200_000
+    for b0 in range(0, len(a), BLK):
+        f = ck / f"xl_{b0}.npy"
+        if f.exists():
+            xl[b0:b0 + BLK] = np.load(f)
+            print(f"  block {b0:,}: loaded from checkpoint", flush=True)
+            continue
+        part = score(model, tok, a[b0:b0 + BLK], b[b0:b0 + BLK])
+        np.save(str(f) + ".tmp.npy", part)
+        os.replace(str(f) + ".tmp.npy", f)   # atomic: a crash can never leave a half-written checkpoint under its final name
+        xl[b0:b0 + BLK] = part
+        print(f"  scored {min(b0 + BLK, len(a)):,}/{len(a):,}  ({time.time() - t0:.0f}s)", flush=True)
     print(f"XLM-R scored {len(a):,} pairs in {time.time() - t0:.0f}s ({len(a) / (time.time() - t0):.0f}/s)", flush=True)
 
     prob = scores.prob.to_numpy().astype(np.float64)

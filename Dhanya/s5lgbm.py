@@ -32,7 +32,9 @@ BRANCH = Path("data/branch_candidates")
 GT = Path("data/processed")
 CACHE = Path("data/cache")  # feature caches are keyed by pool run + a hash of FEATS and store the pair ids (checked on load)
 POOL_RUN = os.environ.get("POOL_RUN")  # run whose candidates/ holds the pool; unset = legacy data/candidates
-V2 = os.environ.get("FEATSET", "v1") == "v2"  # v2 adds multi-branch and cross-script/glued-name features
+FEATSET = os.environ.get("FEATSET", "v1")
+V2 = FEATSET in ("v2", "v3")  # v2 adds multi-branch and cross-script/glued-name features
+V3 = FEATSET == "v3"          # v3 adds the dense (bi-encoder) branch score features
 REC = ["entity_id", "name_clean", "addr_clean", "pin_zip", "state_code"]
 CHUNK = 1_000_000
 UNSEEN_THRESHOLD = 0.75
@@ -48,8 +50,9 @@ FEATS_V2_EXTRA = [
     "wa_rank", "wa_score", "wa_rel", "cn_rank", "cn_score", "cn_rel", "n_branches",
     "name_desp_ratio", "name_desp_partial", "name_skel_ratio", "addr_i_empty", "is_s3",
 ]
-FEATS = FEATS_V1 + (FEATS_V2_EXTRA if V2 else [])
-BRANCH_COLS = ["lex_rank", "lex_score", "dense_rank", "wa_rank", "wa_score", "cn_rank", "cn_score"]
+FEATS_V3_EXTRA = ["dense_score", "dense_rel"]   # dense_rank is already in FEATS_V1 (it was the UniBlocker slot)
+FEATS = FEATS_V1 + (FEATS_V2_EXTRA if V2 else []) + (FEATS_V3_EXTRA if V3 else [])
+BRANCH_COLS = ["lex_rank", "lex_score", "dense_rank", "dense_score", "wa_rank", "wa_score", "cn_rank", "cn_score"]
 
 
 # ── pair table ────────────────────────────────────────────────────────────────
@@ -72,7 +75,7 @@ def build_pairs(split: str) -> pd.DataFrame:
             pairs[c] = np.nan
     if "n_branches" not in pairs.columns:
         pairs["n_branches"] = pairs[["lex_rank", "wa_rank", "cn_rank", "dense_rank"]].notna().sum(axis=1).astype(np.float32)
-    for b in ("lex", "wa", "cn"):
+    for b in ("lex", "wa", "cn", "dense"):
         pairs[f"{b}_rel"] = pairs[f"{b}_score"] / pairs.groupby("entity_id_s1")[f"{b}_score"].transform("max")
     return pairs
 
@@ -168,6 +171,9 @@ def build_features(pairs: pd.DataFrame, split: str) -> pd.DataFrame:
     f = pd.concat(parts)
     for c in ("lex_rank", "lex_score", "lex_rel", "dense_rank") + (("wa_rank", "wa_score", "wa_rel", "cn_rank", "cn_score", "cn_rel", "n_branches") if V2 else ()):
         f[c] = pairs[c].to_numpy(np.float32)
+    if V3:
+        for c in ("dense_score", "dense_rel"):
+            f[c] = pairs[c].to_numpy(np.float32)
     g_s1 = pairs.entity_id_s1.to_numpy()
     g_rec = pairs.entity_id_s2s3.to_numpy()
     f["_s1"], f["_rec"] = pd.factorize(g_s1)[0], pd.factorize(g_rec)[0]

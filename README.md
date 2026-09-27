@@ -7,6 +7,7 @@ All code is in [`Dhanya/`](Dhanya/); run everything from inside that directory.
 |---|---|---|---|
 | 1 | Per-country sparse BM25 blocking + LightGBM pair classifier | 0.904 | **0.879** |
 | 2 | + address-only and character n-gram blocking, cross-script features, XLM-R cross-encoder on uncertain pairs | 0.959 | **0.941** |
+| 3 | + dense (semantic) retrieval with a fine-tuned multilingual bi-encoder, dense features in the classifier | 0.974 | **0.964** |
 
 ## Approach
 
@@ -16,9 +17,12 @@ All code is in [`Dhanya/`](Dhanya/); run everything from inside that directory.
    - submission 2 adds two independent BM25 representations, top 5 each (`s4ngram.py`): address-only words (**Wa**) and
      character 4-grams of the romanized, despaced name (**Cn**; any script is transliterated with `anyascii`), which recover
      names in another script, glued/domain-style names, typos and records with an empty address;
+   - submission 3 adds a **dense branch** (`s4dense.py`): `paraphrase-multilingual-MiniLM-L12-v2` (Apache-2.0) fine-tuned
+     contrastively on the val pairs (in-batch + one hard negative per anchor), every record embedded as "name | address",
+     exact nearest-neighbour search on the GPU, top 5 per S1 entity; it lifts val pool recall from 93.3% to 97.6%;
    - the branches are unioned per pair, keeping each branch's rank and score (`s4union.py` / `s4representations.py`).
 3. **Pair scoring**: a LightGBM classifier on name/address similarity features (`s5lgbm.py`, `FEATSET=v1` is submission 1,
-   `FEATSET=v2` adds branch ranks/scores and cross-script, glued-name and house-number features).
+   `FEATSET=v2` adds branch ranks/scores and cross-script, glued-name and house-number features, `FEATSET=v3` adds the dense score).
 4. **Second stage (submission 2)**: pairs whose LightGBM probability is in [0.10, 0.95] are re-scored by a fine-tuned
    `xlm-roberta-base` cross-encoder (MIT license) and blended with LightGBM (`xlmr_cross.py`).
 5. **Decision**: each S2/S3 record goes to at most one S1 entity (its highest-scoring one, true in the training labels),
@@ -45,11 +49,13 @@ dataset/student_resource/dataset/train/{train_source1,train_source2,train_source
 dataset/student_resource/dataset/test/{test_source1,test_source2,test_source3}.tsv
 ```
 
-Download the cross-encoder weights once (about 1.1 GB, MIT license; only needed for submission 2):
+Download the model weights once (only needed for submissions 2 and 3): the cross-encoder `xlm-roberta-base` (about 1.1 GB, MIT)
+and, for submission 3, the bi-encoder base `paraphrase-multilingual-MiniLM-L12-v2` (about 0.5 GB, Apache-2.0):
 
 ```bash
 cd Dhanya
 python -c "from huggingface_hub import snapshot_download as d; d('FacebookAI/xlm-roberta-base', local_dir='data/models/xlm-roberta-base', allow_patterns=['config.json','model.safetensors','sentencepiece.bpe.model','tokenizer.json','tokenizer_config.json'])"
+python -c "from huggingface_hub import snapshot_download as d; d('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2', local_dir='data/models/paraphrase-multilingual-MiniLM-L12-v2', ignore_patterns=['onnx/*','openvino/*','*.h5','*.msgpack','tf_model*','rust_model*','pytorch_model.bin'])"
 ```
 
 ## Running the pipeline
@@ -116,6 +122,35 @@ RUN_ID=xlmr_test XLMR_RUN=xlmr_v1 LGB_RUN=lgb_test_v2 POOL_RUN=cand_test_cap5 FE
 
 The last step is the slowest: 2.1 million test pairs were re-scored in about 100 minutes on the 8 GB GPU.
 
+### Submission 3: dense retrieval branch (leaderboard 0.964)
+
+Needs submission 2's runs: `cand_v2_cap5` (its val pool supplies the hard negatives for the bi-encoder) and `xlmr_v1` (the cross-encoder).
+
+```bash
+export RUN_ID=dense_v1
+python s4dense.py train                                   # bi-encoder fine-tune, about 19 min (GPU)
+python s4dense.py encode val && python s4dense.py search val 10      # embed 10.3M records (about 45 min) + exact top-10 search (about 7 min)
+python s4dense.py encode test && python s4dense.py search test 10    # about 50 min + 30 min
+unset RUN_ID
+
+# pools = lexical (<= 20) + Wa (<= 5) + Cn (<= 5) + dense (<= 5)
+B=runs/cand_v2/branches; D=runs/dense_v1/branches
+RUN_ID=cand_v3_cap5      python s4union.py val  lex=data/branch_candidates/val_sparkly.parquet:20  wa=$B/val_Wa.parquet:5  cn=$B/val_Cn.parquet:5  dense=$D/val_dense.parquet:5
+RUN_ID=cand_v3_test_cap5 python s4union.py test lex=data/branch_candidates/test_sparkly.parquet:20 wa=$B/test_Wa.parquet:5 cn=$B/test_Cn.parquet:5 dense=$D/test_dense.parquet:5
+
+RUN_ID=fit_v3_cap5 POOL_RUN=cand_v3_cap5 FEATSET=v3 python s5lgbm.py fit          # holdout F0.5 0.9618 without XLM-R
+# blend weights for the new classifier, reusing the cross-encoder trained in xlmr_v1 (holdout F0.5 0.9742)
+RUN_ID=xlmr_v3 XLMR_MODEL_RUN=xlmr_v1 POOL_RUN=cand_v3_cap5 FEATSET=v3 CLF_RUN=fit_v3_cap5 python xlmr_cross.py eval
+RUN_ID=lgb_test_v3 MODEL_RUN=fit_v3_cap5 POOL_RUN=cand_v3_test_cap5 FEATSET=v3 python s5lgbm.py test      # about 8 min
+RUN_ID=xlmr_test_v3 XLMR_RUN=xlmr_v3 XLMR_MODEL_RUN=xlmr_v1 LGB_RUN=lgb_test_v3 POOL_RUN=cand_v3_test_cap5 FEATSET=v3 python xlmr_cross.py test
+# -> runs/xlmr_test_v3/output/matching_results.tsv (the 0.964 file)
+```
+
+Long jobs are built to survive crashes (the development laptop hard-froze twice under sustained load): the XLM-R test stage saves a
+checkpoint every 200K pairs and resumes from them, `s4dense.py encode` can repair a partially written embedding file
+(`FILL_MISSING=1 python s4dense.py encode test India d`), tokenization retries with a fallback path, and tokenizer
+multithreading is switched off (`TOKENIZERS_PARALLELISM=false`).
+
 ### Validate the output
 
 ```bash
@@ -133,6 +168,7 @@ python utils/validate_submission.py --matching ../../Dhanya/runs/xlmr_test/outpu
 | `Dhanya/s4ngram.py` | independent BM25 branches: address-only (Wa), romanized character n-grams (Cn) |
 | `Dhanya/s4representations.py`, `s4union.py` | union of the branches (submission 1 / submission 2) |
 | `Dhanya/s5lgbm.py` | LightGBM pair classifier, one-to-one assignment, thresholds, TSV writer |
+| `Dhanya/s4dense.py` | dense branch: bi-encoder fine-tune, embedding, exact GPU nearest-neighbour search (submission 3) |
 | `Dhanya/xlmr_cross.py` | XLM-R cross-encoder second stage |
 | `Dhanya/runs.py`, `Dhanya/runs/` | per-run folders; only small metadata (READMEs, `config.json`, `metrics.json`, `blend.json`) is tracked |
 | `Dhanya/s4uniblocker.py`, `s4sparkly.py`, `s5splink.py`, `s5fellegisunter.py`, `s5beval.py` | earlier or abandoned attempts (dense retrieval, Sparkly, Splink), not used by either submission |

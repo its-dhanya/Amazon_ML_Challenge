@@ -1,0 +1,11 @@
+{
+  "run_id": "fit_v3_cap3",
+  "argv": [
+    "s5lgbm.py",
+    "fit"
+  ],
+  "started": "2026-09-27 04:12:56",
+  "git_commit": "f2cc6e84cd3085bfe7655870dccf74703cabb755",
+  "git_dirty": true,
+  "python": "C:\\Users\\bhadr\\.conda\\envs\\boneage\\python.exe"
+}

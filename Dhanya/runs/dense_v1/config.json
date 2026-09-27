@@ -1,0 +1,11 @@
+{
+  "run_id": "dense_v1",
+  "argv": [
+    "s4dense.py",
+    "train"
+  ],
+  "started": "2026-09-27 02:56:57",
+  "git_commit": "f2cc6e84cd3085bfe7655870dccf74703cabb755",
+  "git_dirty": true,
+  "python": "C:\\Users\\bhadr\\.conda\\envs\\boneage\\python.exe"
+}

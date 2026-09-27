@@ -1,0 +1,11 @@
+{
+  "run_id": "xlmr_test_v3",
+  "argv": [
+    "xlmr_cross.py",
+    "test"
+  ],
+  "started": "2026-09-27 05:32:23",
+  "git_commit": "f2cc6e84cd3085bfe7655870dccf74703cabb755",
+  "git_dirty": true,
+  "python": "C:\\Users\\bhadr\\.conda\\envs\\boneage\\python.exe"
+}
