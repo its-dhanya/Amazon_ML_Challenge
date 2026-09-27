@@ -32,6 +32,11 @@ BRANCH = Path("data/branch_candidates")
 GT = Path("data/processed")
 CACHE = Path("data/cache")  # feature caches are keyed by pool run + a hash of FEATS and store the pair ids (checked on load)
 POOL_RUN = os.environ.get("POOL_RUN")  # run whose candidates/ holds the pool; unset = legacy data/candidates
+# fit() only, both optional: blend extra labeled pairs from a SEPARATELY built pool (typically split="train", the
+# 1.99M-entity 90% of train S1 never otherwise used for fitting) into the fit role, on top of val's own fit-role pairs.
+# val's early-stop and holdout are never touched, so the reported holdout F0.5 stays directly comparable across runs.
+EXTRA_POOL_RUN = os.environ.get("EXTRA_POOL_RUN")
+EXTRA_SPLIT = os.environ.get("EXTRA_SPLIT", "train")
 FEATSET = os.environ.get("FEATSET", "v1")
 V2 = FEATSET in ("v2", "v3", "v4", "v5", "v6")  # v2 adds multi-branch and cross-script/glued-name features
 V3 = FEATSET in ("v3", "v4", "v5", "v6")        # v3 adds the dense (bi-encoder) branch score features
@@ -353,9 +358,37 @@ def fit() -> None:
     # (odd hash parity), the half never inspected during the error analysis; 8% of entities early-stop, 72% fit.
     role = split_roles(pairs.entity_id_s1)
     print(f"split (pairs): fit {(role == 0).sum():,}, early-stop {(role == 1).sum():,}, holdout {(role == 2).sum():,}")
+    X_fit, y_fit = X[role == 0], y[role == 0]
+    if EXTRA_POOL_RUN:
+        old_pool_run = POOL_RUN
+        globals()["POOL_RUN"] = EXTRA_POOL_RUN   # build_pairs()/the feature cache key both read the module-level POOL_RUN
+        xp = build_pairs(EXTRA_SPLIT)
+        xgt = pd.read_parquet(GT / f"{EXTRA_SPLIT}_positive_pairs.parquet")[["entity_id_s1", "entity_id_s2s3"]].assign(label=1)
+        xp = xp.merge(xgt, how="left", on=["entity_id_s1", "entity_id_s2s3"])
+        xp["label"] = xp.label.fillna(0).astype(int)
+        print(f"extra pool ({EXTRA_SPLIT}, {EXTRA_POOL_RUN}): {len(xp):,} pairs, positives {xp.label.mean():.1%}")
+        xcache = CACHE / f"{EXTRA_SPLIT}_features_{EXTRA_POOL_RUN}_{hashlib.md5(','.join(FEATS).encode()).hexdigest()[:8]}.parquet"
+        if xcache.exists():
+            xf = pd.read_parquet(xcache)
+            aligned = (len(xf) == len(xp) and (xf.entity_id_s1.to_numpy() == xp.entity_id_s1.to_numpy()).all()
+                       and (xf.entity_id_s2s3.to_numpy() == xp.entity_id_s2s3.to_numpy()).all())
+            if not aligned:
+                print(f"cache {xcache.name} does not match the extra pool; recomputing")
+                xf = None
+        else:
+            xf = None
+        if xf is None:
+            xf = build_features(xp, EXTRA_SPLIT)
+            xf["entity_id_s1"], xf["entity_id_s2s3"] = xp.entity_id_s1.to_numpy(), xp.entity_id_s2s3.to_numpy()
+            xcache.parent.mkdir(parents=True, exist_ok=True)
+            xf.to_parquet(xcache)
+        globals()["POOL_RUN"] = old_pool_run     # restore: everything below this point (holdout eval, test scoring) uses val's own pool
+        X_fit = pd.concat([X_fit, xf[FEATS]], ignore_index=True)
+        y_fit = np.concatenate([y_fit, xp.label.to_numpy()])
+        print(f"fit set after adding the extra pool: {len(X_fit):,} pairs (was {int((role == 0).sum()):,})")
     m = lgb.LGBMClassifier(n_estimators=4000, learning_rate=0.1, num_leaves=127, subsample=0.8, subsample_freq=1,
                            colsample_bytree=0.8, min_child_samples=50, n_jobs=-1, verbose=-1)
-    m.fit(X[role == 0], y[role == 0], eval_set=[(X[role == 1], y[role == 1])],
+    m.fit(X_fit, y_fit, eval_set=[(X[role == 1], y[role == 1])],
           callbacks=[lgb.early_stopping(100, verbose=False)])
     print(f"best iteration {m.best_iteration_}")
     print(pd.Series(m.booster_.feature_importance("gain"), FEATS).sort_values(ascending=False).round(0).to_string())
